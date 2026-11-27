@@ -29,7 +29,7 @@ The main datasets and external resources used are:
 - **Literary evaluation:** Virginia Woolf's *To the Lighthouse* and its published Basque and Catalan translations:
   - Basque: *Farorantz*, translated by Anton Garikano, available through [Armiarma's liburu-e collection](https://armiarma.eus/liburu-e/).
   - Catalan: *Cap al far*, translated by Xavier Pàmies; the digital edition used in the study was obtained from [PocketBook](https://pocketbook.es/cap-al-far-9788498594799).
-- **Synonym-frequency analysis:** [Apertium English–Catalan](https://github.com/apertium/apertium-eng-cat) and [Apertium Basque–English](https://github.com/apertium/apertium-eu-en) bilingual dictionaries.
+
 
 
 
