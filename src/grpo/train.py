@@ -1,0 +1,793 @@
+"""Train P5 GRPO adapters from P4 checkpoints"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import math
+import os
+import shutil
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Mapping
+
+import torch
+from datasets import Dataset
+from transformers import set_seed
+
+from src.grpo.checkpoint_selection import (
+    SELECTION_METRIC,
+    CheckpointSelectionTrainerMixin,
+    DevelopmentCheckpointEvaluator,
+    validate_selection_training,
+)
+from src.grpo.data import build_grpo_records, load_grpo_records
+from src.grpo.reward import build_translation_grpo_reward
+from src.sft.train import (
+    _torch_dtype,
+    align_fsdp_qlora_parameter_dtypes,
+    distributed_rank,
+    distributed_world_size,
+    load_sft_base_model,
+    load_sft_tokenizer,
+    prepare_model_for_distributed_qlora_training,
+    resolve_sft_settings,
+)
+from src.utils.config import (
+    get_model_entry,
+    load_grpo_config,
+    load_sft_config,
+    merge_model_overrides,
+)
+from src.utils.errors import PipelineError
+from src.utils.io import save_json
+
+logger = logging.getLogger(__name__)
+
+
+def resolve_grpo_settings(config: Mapping[str, Any], model_key: str) -> dict[str, Any]:
+    return merge_model_overrides(config, "grpo", model_key)
+
+
+def _prepare_trl_vllm_import() -> None:
+    """Provide TRL's removed guided-decoding symbol when it is imported but unused."""
+    try:
+        import vllm.sampling_params as sampling_params
+    except ImportError:
+        return
+    if hasattr(sampling_params, "GuidedDecodingParams"):
+        return
+
+    class _UnsupportedGuidedDecodingParams:
+        def __init__(self, *_: Any, **__: Any) -> None:
+            raise PipelineError(
+                "P5 disables vLLM generation. Guided decoding is incompatible with the installed "
+                "vLLM API; keep training.use_vllm=false."
+            )
+
+    sampling_params.GuidedDecodingParams = _UnsupportedGuidedDecodingParams
+
+
+@contextmanager
+def _temporary_generation_cache(*configs: Any):
+    """Enable KV caching only while sampling, then restore training settings."""
+    previous: list[tuple[Any, Any]] = []
+    for config in configs:
+        if config is None:
+            continue
+        previous.append((config, getattr(config, "use_cache", None)))
+        config.use_cache = True
+    try:
+        yield
+    finally:
+        for config, use_cache in previous:
+            config.use_cache = use_cache
+
+
+@contextmanager
+def _generation_in_eval_mode(model: Any):
+    """Use eval mode only during decoding, preserving TRL's training batches and statistics."""
+    original_generate = model.generate
+    had_instance_method = "generate" in vars(model)
+
+    def generate(*args: Any, **kwargs: Any) -> Any:
+        was_training = model.training
+        model.eval()
+        try:
+            return original_generate(*args, **kwargs)
+        finally:
+            model.train(was_training)
+
+    model.generate = generate
+    try:
+        yield
+    finally:
+        if had_instance_method:
+            model.generate = original_generate
+        else:
+            del model.generate
+
+
+def _load_trl(
+    vllm_model_kwargs: Mapping[str, Any] | None = None,
+    vllm_lora_adapter: Path | None = None,
+    vllm_lora_sync_dir: Path | None = None,
+) -> tuple[Any, Any]:
+    import trl.import_utils as trl_import_utils
+
+    # Delay the vLLM import until Trainer has sharded the 70B policy.
+    original_vllm_available = trl_import_utils._vllm_available
+    trl_import_utils._vllm_available = False
+    try:
+        from trl import GRPOConfig, GRPOTrainer
+    except (ImportError, RuntimeError) as exc:
+        raise PipelineError(
+            "P5 GRPO requires a compatible TRL installation. Install the project GRPO extra."
+        ) from exc
+    finally:
+        trl_import_utils._vllm_available = original_vllm_available
+
+    import trl.trainer.grpo_trainer as grpo_trainer_module
+
+    class LazyLLM:
+        def __new__(cls, *args: Any, **kwargs: Any) -> Any:
+            from vllm import LLM
+
+            return LLM(*args, **kwargs)
+
+    class LazySamplingParams:
+        def __new__(cls, *args: Any, **kwargs: Any) -> Any:
+            from vllm import SamplingParams
+
+            guided_decoding = kwargs.pop("guided_decoding", None)
+            if guided_decoding is not None:
+                raise PipelineError("Guided decoding is not supported by the installed vLLM API.")
+            return SamplingParams(*args, **kwargs)
+
+    class UnsupportedGuidedDecodingParams:
+        def __init__(self, *_: Any, **__: Any) -> None:
+            raise PipelineError("Guided decoding is not supported by the installed vLLM API.")
+
+    grpo_trainer_module.is_vllm_available = lambda: True
+    grpo_trainer_module.LLM = LazyLLM
+    grpo_trainer_module.SamplingParams = LazySamplingParams
+    grpo_trainer_module.GuidedDecodingParams = UnsupportedGuidedDecodingParams
+
+    class TranslationGRPOTrainer(CheckpointSelectionTrainerMixin, GRPOTrainer):
+        """Generate rollouts in eval mode, then restore train mode for optimization."""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            if not vllm_model_kwargs:
+                super().__init__(*args, **kwargs)
+                return
+
+            import trl.trainer.grpo_trainer as grpo_trainer_module
+
+            original_llm = grpo_trainer_module.LLM
+
+            def configured_llm(*llm_args: Any, **llm_kwargs: Any) -> Any:
+                llm_kwargs.update(dict(vllm_model_kwargs))
+                return original_llm(*llm_args, **llm_kwargs)
+
+            grpo_trainer_module.LLM = configured_llm
+            try:
+                super().__init__(*args, **kwargs)
+            finally:
+                grpo_trainer_module.LLM = original_llm
+            if self.use_vllm and bool(vllm_model_kwargs.get("enable_sleep_mode", False)):
+                self.llm.sleep(level=1, mode="abort")
+                self._vllm_is_sleeping = True
+
+        def _generate_and_score_completions(self, inputs: Any) -> Any:
+            if not hasattr(self, "_fsdp_rollout_unit_count"):
+                self._fsdp_rollout_unit_count = _validate_fsdp_rollout_wrapping(self)
+            if self.use_vllm:
+                if getattr(self, "_vllm_is_sleeping", False):
+                    self.llm.wake_up()
+                    self._vllm_is_sleeping = False
+                try:
+                    return super()._generate_and_score_completions(inputs)
+                finally:
+                    self.llm.sleep(level=1, mode="abort")
+                    self._vllm_is_sleeping = True
+            with (
+                _generation_in_eval_mode(self.model),
+                _temporary_generation_cache(self.model.config, self.generation_config),
+            ):
+                return super()._generate_and_score_completions(inputs)
+
+        def _move_model_to_vllm(self) -> None:
+            if vllm_lora_adapter is None:
+                return super()._move_model_to_vllm()
+            _sync_lora_adapter_to_vllm(
+                self,
+                initial_adapter=vllm_lora_adapter,
+                sync_root=vllm_lora_sync_dir,
+            )
+
+    return GRPOConfig, TranslationGRPOTrainer
+
+
+def _normalise_peft_lora_key(name: str) -> str:
+    for wrapper in ("_fsdp_wrapped_module.", "_checkpoint_wrapped_module."):
+        name = name.replace(wrapper, "")
+    return name.replace(".default.", ".")
+
+
+def _save_fsdp_lora_adapter(model: Any, adapter_dir: Path, source_adapter: Path) -> None:
+    """Save only LoRA tensors in a vLLM-compatible PEFT directory."""
+    from safetensors.torch import save_file
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+    tensors: dict[str, torch.Tensor] = {}
+    visited: set[str] = set()
+
+    def visit(module: Any, prefix: str = "") -> None:
+        for child_name, child in module.named_children():
+            child_prefix = f"{prefix}.{child_name}" if prefix else child_name
+            visit(child, child_prefix)
+        if not isinstance(module, FSDP):
+            return
+        with FSDP.summon_full_params(module, recurse=False, writeback=False):
+            for param_name, parameter in module.named_parameters():
+                full_name = f"{prefix}.{param_name}" if prefix else param_name
+                full_name = _normalise_peft_lora_key(full_name)
+                if "lora_" not in full_name or full_name in visited:
+                    continue
+                visited.add(full_name)
+                if distributed_rank() == 0:
+                    tensors[full_name] = (
+                        parameter.detach().to(device="cpu", dtype=torch.bfloat16).contiguous()
+                    )
+
+    visit(model)
+    if distributed_rank() == 0:
+        if not tensors:
+            raise PipelineError("FSDP adapter synchronization found no LoRA tensors.")
+        adapter_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_adapter / "adapter_config.json", adapter_dir / "adapter_config.json")
+        save_file(tensors, adapter_dir / "adapter_model.safetensors")
+    torch.distributed.barrier()
+
+
+def _sync_lora_adapter_to_vllm(trainer: Any, initial_adapter: Path, sync_root: Path | None) -> None:
+    """Generate with the active LoRA and refresh it after each policy update."""
+    from vllm.lora.request import LoRARequest
+
+    step = int(trainer.state.global_step)
+    if step == 0:
+        adapter_path = initial_adapter
+    else:
+        if sync_root is None:
+            raise PipelineError("A vLLM LoRA synchronization directory is required.")
+        adapter_path = sync_root / f"step_{step:06d}"
+        _save_fsdp_lora_adapter(trainer.model, adapter_path, initial_adapter)
+
+    old_id = getattr(trainer, "_active_vllm_lora_id", None)
+    if old_id is not None:
+        trainer.llm.llm_engine.remove_lora(int(old_id))
+    adapter_config = json.loads(
+        (initial_adapter / "adapter_config.json").read_text(encoding="utf-8")
+    )
+    request = LoRARequest(
+        f"p5_step_{step}",
+        step + 1,
+        str(adapter_path.resolve()),
+        base_model_name=str(adapter_config.get("base_model_name_or_path") or ""),
+    )
+    if not hasattr(trainer, "_vllm_generate_without_lora"):
+        trainer._vllm_generate_without_lora = trainer.llm.generate
+    generate = trainer._vllm_generate_without_lora
+
+    def generate_with_lora(*args: Any, **kwargs: Any) -> Any:
+        kwargs["lora_request"] = request
+        return generate(*args, **kwargs)
+
+    trainer.llm.generate = generate_with_lora
+    trainer._active_vllm_lora_id = request.lora_int_id
+    trainer.llm.reset_prefix_cache()
+
+
+@contextmanager
+def _peft_adapter_loading_compatibility(model: Any):
+    """Skip PEFT's tensor-parallel hook for a non-TP FSDP model."""
+    from transformers.integrations import tensor_parallel
+
+    if hasattr(tensor_parallel, "EmbeddingParallel"):
+        yield
+        return
+    if any(getattr(module, "_hf_device_mesh", None) is not None for module in model.modules()):
+        raise PipelineError(
+            "PEFT requires Transformers to provide EmbeddingParallel for an active "
+            "tensor-parallel model. Use compatible PEFT/Transformers versions."
+        )
+
+    from peft.utils import save_and_load
+
+    original_hook = save_and_load._maybe_shard_state_dict_for_tp
+    save_and_load._maybe_shard_state_dict_for_tp = lambda *_args, **_kwargs: None
+    try:
+        yield
+    finally:
+        save_and_load._maybe_shard_state_dict_for_tp = original_hook
+
+
+def _validate_parent_adapter_lora(sft_adapter_dir: Path, lora: dict[str, Any]) -> None:
+    """Check that P4 and P5 use the same LoRA rank and alpha."""
+    config_path = sft_adapter_dir / "adapter_config.json"
+    adapter_config = json.loads(config_path.read_text(encoding="utf-8"))
+    expected_r = int(lora["r"])
+    expected_alpha = int(lora["lora_alpha"])
+    actual_r = adapter_config.get("r")
+    actual_alpha = adapter_config.get("lora_alpha")
+    if actual_r != expected_r or actual_alpha != expected_alpha:
+        raise PipelineError(
+            "P5 requires its P4 parent adapter to use LoRA r={} and alpha={}; found r={} and alpha={} "
+            "in {}. Retrain P4 with configs/sft.yaml before launching P5.".format(
+                expected_r, expected_alpha, actual_r, actual_alpha, config_path
+            )
+        )
+
+
+def _validate_trainable_lora_parameters(model: Any) -> int:
+    """Check that the loaded P4 adapter has trainable LoRA weights."""
+    trainable = [
+        (name, parameter)
+        for name, parameter in model.named_parameters()
+        if bool(parameter.requires_grad)
+    ]
+    lora_parameters = [
+        (name, parameter) for name, parameter in trainable if "lora_" in name.lower()
+    ]
+    parameter_count = sum(int(parameter.numel()) for _, parameter in lora_parameters)
+    if parameter_count == 0:
+        raise PipelineError("P5 LoRA adapter has no trainable parameters.")
+    logger.info(
+        "P5 LoRA trainable parameters: %d tensors, %d parameters",
+        len(lora_parameters),
+        parameter_count,
+    )
+    return parameter_count
+
+
+def _validate_fsdp_rollout_wrapping(trainer: Any) -> int:
+    """Check that FSDP wraps decoder layers separately before 70B rollouts."""
+    if not bool(trainer.is_fsdp_enabled):
+        return 0
+
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+    units = [module for module in trainer.model_wrapped.modules() if isinstance(module, FSDP)]
+    if len(units) < 2:
+        raise PipelineError(
+            "FSDP created only one root unit. GRPO rollout generation would gather "
+            "the complete model on every GPU. Configure "
+            "fsdp_transformer_layer_cls_to_wrap for the model's decoder layer."
+        )
+    logger.info(
+        "P5 FSDP rollout layout: %d units (%d nested decoder units)",
+        len(units),
+        len(units) - 1,
+    )
+    return len(units)
+
+
+@dataclass(frozen=True)
+class GRPOBatchPlan:
+    """Batch sizes in completions and distinct source prompts."""
+
+    world_size: int
+    per_device_batch_size: int
+    gradient_accumulation_steps: int
+    num_generations: int
+    generation_batch_size: int
+    effective_completion_batch_size: int
+    effective_prompt_batch_size: int
+    prompts_per_generation_batch: int
+
+
+def resolve_grpo_batch_plan(training: dict[str, Any], world_size: int = 1) -> GRPOBatchPlan:
+    """Resolve TRL's distributed completion batches into source-prompt batches."""
+    if world_size <= 0:
+        raise PipelineError("world_size must be positive.")
+    per_device = int(training["per_device_train_batch_size"])
+    accumulation = int(training["gradient_accumulation_steps"])
+    generations = int(training["num_generations"])
+    generation_batch = int(training["generation_batch_size"])
+    global_micro_batch = per_device * world_size
+    effective_completions = global_micro_batch * accumulation
+    if effective_completions % generations:
+        raise PipelineError(
+            f"Effective completion batch {effective_completions} is not divisible by G={generations}."
+        )
+    if generation_batch % generations:
+        raise PipelineError(
+            f"Generation batch {generation_batch} is not divisible by G={generations}."
+        )
+    if generation_batch % global_micro_batch:
+        raise PipelineError(
+            f"Generation batch {generation_batch} is not divisible by distributed "
+            f"micro-batch {global_micro_batch}."
+        )
+    effective_prompts = effective_completions // generations
+    configured_prompts = int(training["effective_prompt_batch_size"])
+    if effective_prompts != configured_prompts:
+        raise PipelineError(
+            f"Effective prompt batch is {effective_prompts}, not configured {configured_prompts}."
+        )
+    return GRPOBatchPlan(
+        world_size=world_size,
+        per_device_batch_size=per_device,
+        gradient_accumulation_steps=accumulation,
+        num_generations=generations,
+        generation_batch_size=generation_batch,
+        effective_completion_batch_size=effective_completions,
+        effective_prompt_batch_size=effective_prompts,
+        prompts_per_generation_batch=generation_batch // generations,
+    )
+
+
+def train_grpo(
+    dataset_key: str,
+    model_key: str,
+    ablation: str | None = None,
+    config_path: str | Path = "configs/grpo.yaml",
+    sft_config_path: str | Path = "configs/sft.yaml",
+    models_config_path: str | Path = "configs/models.yaml",
+    resume_from_checkpoint: str | None = None,
+    max_train_examples: int | None = None,
+    adapter_root: str | Path | None = None,
+    results_root: str | Path | None = None,
+    sft_adapter_root: str | Path | None = None,
+) -> dict[str, str]:
+    """Train one P5 ablation from its P4 adapter."""
+    grpo_config = load_grpo_config(config_path)["grpo"]
+    grpo_root = resolve_grpo_settings(grpo_config, model_key)
+    selected_ablation = str(ablation or grpo_root["reward"]["active_ablation"])
+
+    model_entry = get_model_entry(model_key, models_config_path)
+    sft_root = load_sft_config(sft_config_path)["sft"]
+    sft_settings = resolve_sft_settings(sft_root, model_key)
+    target_lang = str(grpo_root["target_languages"][dataset_key])
+    training = grpo_root["training"]
+    validate_selection_training(training)
+    set_seed(int(training["seed"]))
+    blocked_reason = training.get("blocked_reason")
+    if blocked_reason:
+        raise PipelineError(str(blocked_reason))
+    world_size = distributed_world_size()
+    if torch.cuda.is_available():
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        torch.cuda.set_device(local_rank)
+        logger.info("Bound distributed rank %d to CUDA device %d", distributed_rank(), local_rank)
+    required_world_size = int(training.get("required_world_size", world_size))
+    if world_size != required_world_size:
+        raise PipelineError(
+            f"{model_key} GRPO requires {required_world_size} distributed processes; "
+            f"found {world_size}."
+        )
+    required_cuda_devices = int(training.get("required_cuda_devices", 0))
+    if torch.cuda.device_count() < required_cuda_devices:
+        raise PipelineError(
+            f"{model_key} GRPO requires {required_cuda_devices} visible CUDA devices; "
+            f"found {torch.cuda.device_count()}."
+        )
+    reward = build_translation_grpo_reward(grpo_root, dataset_key, ablation=selected_ablation)
+    batch_plan = resolve_grpo_batch_plan(training, world_size=world_size)
+    if batch_plan.num_generations != reward.group_size:
+        raise PipelineError("training.num_generations must equal reward.group_size.")
+    global_eval_batch = int(training["per_device_eval_batch_size"]) * batch_plan.world_size
+    if global_eval_batch % batch_plan.num_generations != 0:
+        raise PipelineError(
+            "The global evaluation batch must be divisible by training.num_generations."
+        )
+
+    tokenizer = load_sft_tokenizer(model_entry)
+    tokenizer.padding_side = "left"
+    base_model = load_sft_base_model(model_entry, sft_settings, training=True)
+    from peft import PeftModel, prepare_model_for_kbit_training
+    if bool(sft_settings["quantization"].get("load_in_4bit", False)):
+        gradient_checkpointing = bool(training["gradient_checkpointing"])
+        gradient_checkpointing_kwargs = dict(training.get("gradient_checkpointing_kwargs", {}))
+        if world_size > 1:
+            base_model = prepare_model_for_distributed_qlora_training(
+                base_model,
+                gradient_checkpointing,
+                gradient_checkpointing_kwargs,
+            )
+        else:
+            base_model = prepare_model_for_kbit_training(
+                base_model,
+                use_gradient_checkpointing=gradient_checkpointing,
+                gradient_checkpointing_kwargs=gradient_checkpointing_kwargs,
+            )
+    sft_adapter_dir = (
+        Path(sft_adapter_root or grpo_root["sft_adapter_roots"][dataset_key])
+        / dataset_key
+        / model_key
+    )
+    if not sft_adapter_dir.exists():
+        raise PipelineError(f"P4 SFT adapter not found: {sft_adapter_dir}")
+    _validate_parent_adapter_lora(sft_adapter_dir, dict(grpo_root["lora"]))
+    native_vllm_lora = sft_adapter_dir if bool(training.get("vllm_native_lora", False)) else None
+    vllm_sync_dir = (
+        Path(results_root or grpo_root["results_root"])
+        / selected_ablation
+        / dataset_key
+        / model_key
+        / "vllm_adapter_sync"
+    )
+    GRPOConfig, GRPOTrainer = _load_trl(
+        training.get("vllm_model_kwargs"),
+        vllm_lora_adapter=native_vllm_lora,
+        vllm_lora_sync_dir=vllm_sync_dir,
+    )
+    with _peft_adapter_loading_compatibility(base_model):
+        model = PeftModel.from_pretrained(
+            base_model,
+            sft_adapter_dir,
+            is_trainable=True,
+            autocast_adapter_dtype=bool(grpo_root["lora"].get("autocast_adapter_dtype", True)),
+        )
+    if world_size > 1 and bool(sft_settings["quantization"].get("load_in_4bit", False)):
+        align_fsdp_qlora_parameter_dtypes(
+            model,
+            _torch_dtype(bool(sft_settings["training"].get("bf16", True))),
+        )
+    trainable_lora_parameters = _validate_trainable_lora_parameters(model)
+    model_devices = {
+        str(device)
+        for device in getattr(model, "hf_device_map", {}).values()
+        if str(device) not in {"cpu", "disk"}
+    }
+    required_model_devices = int(training.get("required_model_devices", 0))
+    if len(model_devices) < required_model_devices:
+        raise PipelineError(
+            f"{model_key} must be sharded across {required_model_devices} CUDA devices; "
+            f"the resolved device map uses {sorted(model_devices)}."
+        )
+    logger.info("P5 policy device map uses: %s", sorted(model_devices))
+    model.config.use_cache = False
+
+    prompt_spec = grpo_root["chat_format"].get("prompt_spec")
+    data_dir = grpo_root["data_dir"]
+    train_records = build_grpo_records(
+        load_grpo_records(data_dir, dataset_key, "train"),
+        tokenizer,
+        model_entry,
+        target_lang,
+        prompt_spec=prompt_spec,
+        enable_thinking=bool(grpo_root["chat_format"].get("enable_thinking", False)),
+    )
+    if max_train_examples is not None:
+        if max_train_examples <= 0:
+            raise PipelineError("max_train_examples must be positive when provided.")
+        train_records = train_records[:max_train_examples]
+    evaluation_enabled = str(training["eval_strategy"]).lower() != "no"
+    dev_records = []
+    if evaluation_enabled:
+        dev_records = build_grpo_records(
+            load_grpo_records(data_dir, dataset_key, "dev"),
+            tokenizer,
+            model_entry,
+            target_lang,
+            prompt_spec=prompt_spec,
+            enable_thinking=bool(grpo_root["chat_format"].get("enable_thinking", False)),
+        )
+
+    adapter_dir = (
+        Path(adapter_root or grpo_root["adapter_root"])
+        / selected_ablation
+        / dataset_key
+        / model_key
+    )
+    run_dir = (
+        Path(results_root or grpo_root["results_root"])
+        / selected_ablation
+        / dataset_key
+        / model_key
+    )
+    if adapter_dir.exists() and resume_from_checkpoint is None:
+        raise FileExistsError(f"P5 adapter already exists: {adapter_dir}")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    generation_kwargs = dict(training["generation_kwargs"])
+    if bool(training.get("use_vllm", False)):
+        generation_kwargs.pop("do_sample", None)
+        generation_kwargs.pop("num_beams", None)
+        if "min_new_tokens" in generation_kwargs:
+            generation_kwargs["min_tokens"] = generation_kwargs.pop("min_new_tokens")
+
+    trainer_args = GRPOConfig(
+        output_dir=str(run_dir / "trainer"),
+        run_name=f"p5_grpo_{selected_ablation}_{dataset_key}_{model_key}",
+        num_train_epochs=float(training["num_train_epochs"]),
+        learning_rate=float(training["learning_rate"]),
+        per_device_train_batch_size=int(training["per_device_train_batch_size"]),
+        per_device_eval_batch_size=int(training["per_device_eval_batch_size"]),
+        gradient_accumulation_steps=int(training["gradient_accumulation_steps"]),
+        generation_batch_size=batch_plan.generation_batch_size,
+        warmup_ratio=float(training["warmup_ratio"]),
+        weight_decay=float(training["weight_decay"]),
+        lr_scheduler_type=str(training["lr_scheduler_type"]),
+        optim=str(training["optim"]),
+        logging_steps=int(training["logging_steps"]),
+        eval_strategy=str(training["eval_strategy"]),
+        eval_steps=int(training["eval_steps"]),
+        save_strategy=str(training["save_strategy"]),
+        save_steps=int(training["save_steps"]),
+        save_total_limit=int(training["save_total_limit"]),
+        save_only_model=bool(training.get("save_only_model", False)),
+        load_best_model_at_end=True,
+        metric_for_best_model=SELECTION_METRIC,
+        greater_is_better=True,
+        disable_dropout=bool(training["disable_dropout"]),
+        max_grad_norm=float(training["max_grad_norm"]),
+        gradient_checkpointing=bool(training["gradient_checkpointing"]),
+        gradient_checkpointing_kwargs=dict(training.get("gradient_checkpointing_kwargs", {})),
+        bf16=bool(training["bf16"])
+        and torch.cuda.is_available()
+        and torch.cuda.is_bf16_supported(),
+        tf32=bool(training["tf32"]) and torch.cuda.is_available(),
+        use_vllm=bool(training.get("use_vllm", False)),
+        vllm_mode=str(training.get("vllm_mode", "server")),
+        vllm_tensor_parallel_size=int(training.get("vllm_tensor_parallel_size", 1)),
+        vllm_gpu_memory_utilization=float(training.get("vllm_gpu_memory_utilization", 0.3)),
+        report_to=[],
+        num_generations=int(training["num_generations"]),
+        max_prompt_length=int(training["max_prompt_length"]),
+        max_completion_length=int(training["max_completion_length"]),
+        temperature=float(training["temperature"]),
+        beta=float(training["beta"]),
+        mask_truncated_completions=bool(training["mask_truncated_completions"]),
+        generation_kwargs=generation_kwargs,
+        remove_unused_columns=False,
+        seed=int(training["seed"]),
+    )
+    # Wait for every rank before colocated vLLM reserves GPU memory.
+    if world_size > 1:
+        torch.distributed.barrier()
+
+    trainer = GRPOTrainer(
+        model=model,
+        args=trainer_args,
+        reward_funcs=reward,
+        train_dataset=Dataset.from_list(train_records),
+        eval_dataset=Dataset.from_list(dev_records) if evaluation_enabled else None,
+        processing_class=tokenizer,
+    )
+    selection_settings = dict(grpo_root["checkpoint_selection"])
+    selection_settings.setdefault(
+        "max_input_length", int(sft_settings["chat_format"]["max_seq_length"])
+    )
+    selection_settings.setdefault(
+        "max_new_tokens", int(sft_settings["evaluation"]["max_new_tokens"])
+    )
+    trainer.checkpoint_evaluator = DevelopmentCheckpointEvaluator(
+        dev_records, target_lang, selection_settings, run_dir / "checkpoint_selection"
+    )
+    expected_steps_per_generation = batch_plan.generation_batch_size // (
+        batch_plan.per_device_batch_size * batch_plan.world_size
+    )
+    if int(trainer.args.steps_per_generation) != expected_steps_per_generation:
+        raise PipelineError(
+            "TRL resolved an unexpected steps_per_generation: "
+            f"{trainer.args.steps_per_generation} != {expected_steps_per_generation}."
+        )
+    expected_optimizer_steps = math.ceil(
+        len(train_records) / batch_plan.effective_prompt_batch_size
+    )
+    if math.ceil(expected_optimizer_steps * float(training["num_train_epochs"])) < int(
+        training["eval_steps"]
+    ):
+        raise PipelineError(
+            "This run ends before its first development evaluation. Increase the training "
+            "examples/epochs or reduce eval_steps and save_steps together for a smoke test."
+        )
+    logger.info(
+        "P5 batch plan: %s; expected optimizer steps: %d", batch_plan, expected_optimizer_steps
+    )
+    train_output = trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+    if trainer.state.best_model_checkpoint is None or trainer.state.best_metric is None:
+        raise PipelineError("GRPO training completed without selecting a development checkpoint.")
+    fsdp_unit_count = int(getattr(trainer, "_fsdp_rollout_unit_count", 0))
+    if trainer.is_fsdp_enabled:
+        trainer.accelerator.state.fsdp_plugin.set_state_dict_type("FULL_STATE_DICT")
+    trainer.accelerator.wait_for_everyone()
+    trainer.save_model(str(adapter_dir))
+    if trainer.is_world_process_zero():
+        tokenizer.save_pretrained(adapter_dir)
+    trainer.accelerator.wait_for_everyone()
+    metadata_path = run_dir / "training_metadata.json"
+    metadata = {
+        "experiment_key": "p5_grpo",
+        "stage": "post_training",
+        "dataset_key": dataset_key,
+        "model_key": model_key,
+        "ablation": selected_ablation,
+        "p4_sft_adapter": str(sft_adapter_dir),
+        "p5_adapter": str(adapter_dir),
+        "resume_from_checkpoint": resume_from_checkpoint,
+        "train_examples": len(train_records),
+        "max_train_examples": max_train_examples,
+        "dev_examples": len(dev_records),
+        "in_training_evaluation": evaluation_enabled,
+        "checkpoint_selection": {
+            "metric": SELECTION_METRIC,
+            "greater_is_better": True,
+            "best_model_checkpoint": trainer.state.best_model_checkpoint,
+            "best_score": float(trainer.state.best_metric),
+            "development_fingerprint": trainer.checkpoint_evaluator.fingerprint,
+            "settings": selection_settings,
+            "aggregation": "equal_weight_mean_of_six_metrics",
+            "normalization": "inverse_relative_error; clipped_cometkiwi; 1-metricx/25",
+        },
+        "reward": grpo_root["reward"]["ablations"][selected_ablation],
+        "cometkiwi": grpo_root["reward"]["cometkiwi"],
+        "comet": grpo_root["reward"]["comet"],
+        "training": training,
+        "effective_completion_batch_size": batch_plan.effective_completion_batch_size,
+        "effective_prompt_batch_size": batch_plan.effective_prompt_batch_size,
+        "generation_batch_size": batch_plan.generation_batch_size,
+        "prompts_per_generation_batch": batch_plan.prompts_per_generation_batch,
+        "expected_optimizer_steps": expected_optimizer_steps,
+        "trainable_lora_parameters": trainable_lora_parameters,
+        "sequence_packing": bool(training["sequence_packing"]),
+        "distributed": {
+            "world_size": batch_plan.world_size,
+            "fsdp": bool(trainer.is_fsdp_enabled),
+            "fsdp_unit_count": fsdp_unit_count,
+            "model_parallel": len(model_devices) > 1,
+            "model_devices": sorted(model_devices),
+        },
+        "training_metrics": dict(train_output.metrics),
+        "optimizer_steps": int(trainer.state.global_step),
+    }
+    if trainer.is_world_process_zero():
+        save_json(metadata, metadata_path)
+    trainer.accelerator.wait_for_everyone()
+    return {"adapter_dir": str(adapter_dir), "training_metadata": str(metadata_path)}
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run P5 GRPO from a P4 SFT adapter.")
+    parser.add_argument("--dataset", required=True, choices=("en_ca", "en_eu"))
+    parser.add_argument("--model", required=True)
+    parser.add_argument(
+        "--ablation",
+        choices=("a0", "a1", "a2", "a3", "a4", "a3v2", "a3v3", "a3v4", "a3v5", "a5"),
+        default=None,
+    )
+    parser.add_argument("--config", default="configs/grpo.yaml")
+    parser.add_argument("--sft-config", default="configs/sft.yaml")
+    parser.add_argument("--models-config", default="configs/models.yaml")
+    parser.add_argument("--resume-from-checkpoint", default=None)
+    parser.add_argument("--max-train-examples", type=int, default=None)
+    parser.add_argument("--adapter-root", default=None)
+    parser.add_argument("--results-root", default=None)
+    parser.add_argument("--sft-adapter-root", default=None)
+    args = parser.parse_args()
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+    logger.info(
+        "P5 GRPO complete: %s",
+        train_grpo(
+            args.dataset,
+            args.model,
+            ablation=args.ablation,
+            config_path=args.config,
+            sft_config_path=args.sft_config,
+            models_config_path=args.models_config,
+            resume_from_checkpoint=args.resume_from_checkpoint,
+            max_train_examples=args.max_train_examples,
+            adapter_root=args.adapter_root,
+            results_root=args.results_root,
+            sft_adapter_root=args.sft_adapter_root,
+        ),
+    )
+
+
+if __name__ == "__main__":
+    main()
