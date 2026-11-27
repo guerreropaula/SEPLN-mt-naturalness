@@ -1,7 +1,7 @@
-# Naturalness in LLM Translation for Low-Resource Languages
+# Steering Toward Naturalness: Prompting and Post-Training LLMs for Low-Resource Translation
 
 
-This repository contains the supplementary material for the paper **“Naturalness in LLM Translation for Low-Resource Languages”**.
+This repository contains the supplementary material for the paper **“Steering Toward Naturalness: Prompting and Post-Training LLMs for Low-Resource Translation”**.
 
 The study investigates translation naturalness in Large Language Models (LLMs) for **English-to-Basque (EN→EU)** and **English-to-Catalan (EN→CA)**. It compares interventions of increasing complexity, including **prompting**, **supervised fine-tuning (SFT)**, and **reinforcement learning with Group Relative Policy Optimization (GRPO)**, and evaluates their effect on both translation quality and different dimensions of naturalness.
 
